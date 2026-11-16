@@ -55,6 +55,8 @@ fn frame(surface: &mut super::Surface<'_>) -> Result<String, String> {
     }
     let mut fields = String::new();
     let mut methods = String::new();
+    // Per accessor: the sources its chain tries, each with whether it counts only when lent mutably.
+    let mut chains: Vec<(String, Vec<(String, bool)>)> = Vec::new();
     for owner in super::imports() {
         let name = snake(owner);
         let path = trait_path(owner);
@@ -106,6 +108,7 @@ fn frame(surface: &mut super::Surface<'_>) -> Result<String, String> {
         writeln!(methods, "pub fn set_{name}(&mut self, v: &(dyn {path} + '_)) {{ self.{name} = Some((unsafe {{ std::mem::transmute(v as *const (dyn {path} + '_)) }}, false)); }} pub fn set_{name}_mut(&mut self, v: &mut (dyn {path} + '_)) {{ self.{name} = Some((unsafe {{ std::mem::transmute(v as *mut (dyn {path} + '_)) }}, true)); }}").unwrap();
         for mutable in [false, true] {
             let mut choices = Vec::new();
+            let mut tried: Vec<(String, bool)> = Vec::new();
             for sub in super::imports() {
                 if super::REACHED.iter().any(|(o, ..)| o == sub) {
                     continue;
@@ -115,6 +118,7 @@ fn frame(surface: &mut super::Surface<'_>) -> Result<String, String> {
                     sub.rsplit("::").next().unwrap(),
                     owner.rsplit("::").next().unwrap(),
                 ) {
+                    tried.push((snake(sub), mutable));
                     choices.push(format!(
                         "self.{}{filter}.map(|(p, _)| unsafe {{ &{m}*p as &{m}dyn {path} }})",
                         snake(sub),
@@ -148,6 +152,7 @@ fn frame(surface: &mut super::Surface<'_>) -> Result<String, String> {
                 let filter = if source_mut { ".filter(|(_,m)|*m)" } else { "" };
                 let s = if source_mut { "mut " } else { "" };
                 let m = if mutable { "mut " } else { "" };
+                tried.push((source.clone(), mutable || source_mut));
                 if fallible {
                     choices.push(format!("self.{source}{filter}.and_then(|(p,_)| unsafe {{ (&{s}*p).{}().ok().map(|host| host as &{m}dyn {path}) }})", method.name));
                 } else {
@@ -156,6 +161,10 @@ fn frame(surface: &mut super::Surface<'_>) -> Result<String, String> {
             }
             // The sources are tried in an order that comes from file names, so it must never
             // decide: a call lends at most one of the sources that serve this trait.
+            chains.push((
+                format!("{name}{}", if mutable { "_mut" } else { "" }),
+                tried,
+            ));
             let overlap = if choices.len() > 1 {
                 format!(
                     "debug_assert!([{}].into_iter().filter(|set| *set).count() <= 1, \"overlapping frame sources for {name}\");",
@@ -173,9 +182,156 @@ fn frame(surface: &mut super::Surface<'_>) -> Result<String, String> {
             writeln!(methods, "pub unsafe fn {name}{suffix}(&self) -> Result<&'static {m}dyn {path}, ServeError> {{ {overlap}{expr}.ok_or(ServeError::Missing(\"{name}\")) }}", suffix=if mutable {"_mut"} else {""}, m=if mutable {"mut "} else {""}).unwrap();
         }
     }
+    check_one_source_per_chain(surface, &chains)?;
     Ok(format!(
         "#[derive(Default)] pub struct Frame {{ {fields} }}\n// SAFETY: pointers are used only by unsafe serve during the synchronous call that lent them.\nunsafe impl Send for Frame {{}}\nimpl Frame {{ {methods} }}"
     ))
+}
+
+/// The frame sources a lent value sets, as slots: the sources of one slot are alternatives of
+/// which a call sets one (a variant's cases), the slots of a call are all set. Each source is
+/// its snake-case name and whether it is lent mutably. Mirrors `event_input`.
+fn lent_slots(types: &super::ty::Types<'_>, ty: &Ty, slots: &mut Vec<Vec<(String, bool)>>) {
+    let inner = match ty {
+        Ty::Ref(t, _) => &**t,
+        t => t,
+    };
+    match inner {
+        Ty::Dyn(name, mutable) => slots.push(vec![(snake(name), *mutable)]),
+        Ty::Named(def) if types.defs[*def].lifetimes != 0 && types.defs[*def].view.is_none() => {
+            let def = &types.defs[*def];
+            if def.append.is_some() || def.projection.is_some() {
+                return;
+            }
+            if let super::ty::BorrowedShape::Variant(cases) = &def.borrowed {
+                slots.push(
+                    cases
+                        .iter()
+                        .filter_map(|case| match &case.payload[0] {
+                            Ty::Dyn(name, mutable) => Some((snake(name), *mutable)),
+                            _ => None,
+                        })
+                        .collect(),
+                );
+            } else if let Some(fields) = def.borrowed.fields() {
+                for field in fields.iter() {
+                    lent_slots(types, &field.ty, slots);
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Refuse a call that lends two sources which one accessor chain tries (`host()` tries `host`,
+/// `server_host`, ...): the chain's order follows the role files' names, so it must never decide.
+fn check_one_source_per_chain(
+    surface: &super::Surface<'_>,
+    chains: &[(String, Vec<(String, bool)>)],
+) -> Result<(), String> {
+    for method in surface
+        .methods
+        .iter()
+        .chain(&surface.dropped)
+        .filter(|m| super::exports().contains(&m.owner))
+    {
+        let mut slots = Vec::new();
+        for (_, ty) in &method.params {
+            lent_slots(&surface.types, ty, &mut slots);
+        }
+        if let Some((accessor, a, b)) = overlapping_sources(&slots, chains) {
+            return Err(format!(
+                "{}::{} lends {a} and {b}, which both answer {accessor}(): the frame would pick by role-file name",
+                method.owner, method.name
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// The first accessor and the two sources of `slots` (see [`lent_slots`]) that it tries both.
+/// A source counts in a chain when it is lent and, for a chain that needs it, mutably.
+fn overlapping_sources(
+    slots: &[Vec<(String, bool)>],
+    chains: &[(String, Vec<(String, bool)>)],
+) -> Option<(String, String, String)> {
+    for (accessor, tried) in chains {
+        let reached: Vec<(usize, &str)> = slots
+            .iter()
+            .enumerate()
+            .flat_map(|(i, slot)| {
+                slot.iter()
+                    .filter(|(source, lent_mut)| {
+                        tried
+                            .iter()
+                            .any(|(name, needs_mut)| name == source && (*lent_mut || !needs_mut))
+                    })
+                    .map(move |(source, _)| (i, source.as_str()))
+            })
+            .collect();
+        for (a, (slot_a, source_a)) in reached.iter().enumerate() {
+            if let Some((_, source_b)) = reached[a + 1..]
+                .iter()
+                .find(|(slot_b, source_b)| slot_b != slot_a && source_b != source_a)
+            {
+                return Some((
+                    accessor.clone(),
+                    (*source_a).to_owned(),
+                    (*source_b).to_owned(),
+                ));
+            }
+        }
+    }
+    None
+}
+
+#[cfg(test)]
+mod overlap_tests {
+    use super::overlapping_sources;
+
+    fn source(name: &str, lent_mut: bool) -> (String, bool) {
+        (name.to_owned(), lent_mut)
+    }
+
+    #[test]
+    fn two_lent_sources_of_one_chain_are_found_and_alternatives_and_other_chains_are_not() {
+        let chains = vec![
+            (
+                "host".to_owned(),
+                vec![source("host", false), source("server_host", false)],
+            ),
+            ("host_mut".to_owned(), vec![source("server_host", false)]),
+            ("random".to_owned(), vec![source("level_host", false)]),
+        ];
+        let both = [
+            vec![source("host", false)],
+            vec![source("server_host", false)],
+        ];
+        assert_eq!(
+            overlapping_sources(&both, &chains),
+            Some(("host".into(), "host".into(), "server_host".into()))
+        );
+        // The cases of one variant are alternatives: a call lends one of them.
+        let cases = [vec![source("host", false), source("server_host", false)]];
+        assert_eq!(overlapping_sources(&cases, &chains), None);
+        // Two sources that no one chain tries together.
+        let apart = [
+            vec![source("host", false)],
+            vec![source("level_host", false)],
+        ];
+        assert_eq!(overlapping_sources(&apart, &chains), None);
+        // A chain that needs a mutable lend ignores a source lent shared.
+        let mutable = vec![(
+            "host_mut".to_owned(),
+            vec![source("host", true), source("server_host", true)],
+        )];
+        assert_eq!(overlapping_sources(&both, &mutable), None);
+        let lent_mut = [
+            vec![source("host", true)],
+            vec![source("server_host", true)],
+        ];
+        assert!(overlapping_sources(&lent_mut, &mutable).is_some());
+    }
 }
 
 fn resource(ty: &Ty) -> bool {
